@@ -1,11 +1,21 @@
 from django.shortcuts import render, redirect
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU for Keras to avoid GPU conflicts
+
+print("[INFO] Keras forced to CPU-only mode to avoid GPU memory conflicts")
+
 import torch
+# Force PyTorch to use CPU to avoid GPU conflicts with Keras
+torch.cuda.is_available = lambda: False
+device = torch.device('cpu')
+
+print("[INFO] PyTorch forced to CPU-only mode")
+
 import torchvision
 import torchvision.utils as vutils
 from torchvision import transforms, models
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
-import os
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
@@ -21,7 +31,6 @@ import copy
 from torchvision import models
 import shutil
 from PIL import Image as pImage
-import time
 from django.conf import settings
 from .forms import VideoUploadForm
 
@@ -33,10 +42,6 @@ im_size = 112
 mean=[0.485, 0.456, 0.406]
 std=[0.229, 0.224, 0.225]
 inv_normalize =  transforms.Normalize(mean=-1*np.divide(mean,std),std=np.divide([1,1,1],std))
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
 
 class_labels = {0: 'FAKE', 1: 'REAL'}
 face_crop_margin = 0.3
@@ -195,35 +200,69 @@ def predict(model,img,path = './', video_file_name=""):
 
 
 def predict_keras(keras_model, img, path='./', video_file_name=""):
-    """Predict using a Keras .h5 model. Accepts the same `img` tensor as the PyTorch predict() function.
+    """Predict using a Keras .h5 model. Expects 256x256 input.
+    Accepts the same `img` tensor format as PyTorch predict() [1, seq, 3, H, W].
     Returns [prediction_index, confidence_percent]."""
+    import cv2
+    
     # img shape: [1, seq, 3, H, W]
     x = img.cpu().numpy()
-    # denormalize (reverse torchvision Normalize(mean,std)) -> back to approx [0,1]
+    batch_size, seq_len, c, h, w = x.shape
+    
+    # denormalize (reverse torchvision Normalize(mean,std)) -> back to approx [0,255]
     mean_arr = np.array(mean).reshape(1,1,3,1,1)
     std_arr = np.array(std).reshape(1,1,3,1,1)
     x = x * std_arr + mean_arr
-    # transpose to (1, seq, H, W, 3) which is common for Keras sequence models
-    x = x.transpose(0,1,3,4,2).astype(np.float32)
-    try:
-        preds = keras_model.predict(x)
-    except Exception as e:
-        raise RuntimeError(f"Keras model prediction failed: {e}")
-
-    # Handle various output shapes: (1,2), (1,seq,2), (1,1) (sigmoid)
-    if preds.ndim == 3:
-        preds = preds.mean(axis=1)
-    if preds.ndim == 2 and preds.shape[1] >= 2:
-        probs = preds
-        idx = int(np.argmax(probs, axis=1)[0])
-        confidence = float(np.max(probs, axis=1)[0] * 100)
+    x = np.clip(x * 255, 0, 255).astype(np.uint8)
+    
+    # transpose from (1, seq, 3, H, W) to (seq, H, W, 3)
+    x = x[0].transpose(0, 2, 3, 1)  # (seq, 3, H, W) -> (seq, H, W, 3)
+    
+    # Process each frame individually and collect predictions
+    all_preds = []
+    for frame_idx in range(seq_len):
+        frame = x[frame_idx]
+        frame_resized = cv2.resize(frame, (256, 256))
+        # Normalize to [0, 1]
+        frame_resized = frame_resized.astype(np.float32) / 255.0
+        
+        # Add batch dimension: (1, 256, 256, 3)
+        frame_batch = np.expand_dims(frame_resized, axis=0)
+        
+        try:
+            # Predict on single frame
+            pred = keras_model.predict(frame_batch, verbose=0)
+            all_preds.append(pred)
+        except Exception as e:
+            print(f"[WARNING] Failed to predict frame {frame_idx}: {e}")
+            continue
+    
+    if not all_preds:
+        raise RuntimeError("No frames could be predicted")
+    
+    # Stack predictions and average across frames
+    all_preds = np.vstack(all_preds)  # Shape: (seq, num_classes) or (seq,)
+    print(f"[DEBUG] All predictions shape: {all_preds.shape}")
+    
+    # Average predictions across all frames
+    if all_preds.ndim == 2:
+        # Multiple classes: shape (seq, num_classes)
+        avg_probs = np.mean(all_preds, axis=0)
+        idx = int(np.argmax(avg_probs))
+        confidence = float(np.max(avg_probs) * 100)
         prediction = idx
+        print(f"[DEBUG] Average probs: {avg_probs}")
     else:
-        # Sigmoid single-output
-        val = float(preds.reshape(-1)[0])
-        prediction = 1 if val > 0.5 else 0
-        confidence = val * 100 if prediction == 1 else (100 - val * 100)
+        # Single output (sigmoid): shape (seq,)
+        avg_val = np.mean(all_preds)
+        prediction = 1 if avg_val > 0.5 else 0
+        confidence = avg_val * 100 if prediction == 1 else (100 - avg_val * 100)
+        print(f"[DEBUG] Sigmoid average: {avg_val}")
 
+    print(f"[DEBUG] Prediction: {prediction}, Confidence: {confidence}")
+    
+    # Cleanup
+    del x, all_preds
     return [int(prediction), confidence]
 
 def plot_heat_map(i, model, img, path = './', video_file_name=''):
@@ -377,6 +416,11 @@ def predict_page(request):
         if is_keras_model:
             try:
                 from tensorflow.keras.models import load_model
+                import tensorflow as tf
+                # Prevent TensorFlow from pre-allocating GPU memory
+                gpus = tf.config.list_physical_devices('GPU')
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
             except Exception as e:
                 print(f"TensorFlow/Keras not available: {e}")
                 return render(request, 'cuda_full.html')
@@ -467,6 +511,18 @@ def predict_page(request):
                 # Uncomment if you want to create heat map images
                 # for j in range(sequence_length):
                 #     heatmap_images.append(plot_heat_map(j, model, video_dataset[i], './', video_file_name_only))
+
+            # Cleanup memory after prediction to free up GPU/CPU resources
+            import gc
+            if 'keras_model' in locals() and keras_model is not None:
+                del keras_model
+            if 'model' in locals() and model is not None:
+                del model
+            if 'video_dataset' in locals():
+                del video_dataset
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Render results
             context = {

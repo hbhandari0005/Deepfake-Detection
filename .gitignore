@@ -1,0 +1,9 @@
+venv/
+Django Application/venv/
+
+__pycache__/
+*.py[cod]
+
+Django Application/db.sqlite3
+Django Application/uploaded_images/
+Django Application/uploaded_videos/
