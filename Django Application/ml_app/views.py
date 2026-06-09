@@ -2,14 +2,14 @@ from django.shortcuts import render, redirect
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU for Keras to avoid GPU conflicts
 
-print("[INFO] Keras forced to CPU-only mode to avoid GPU memory conflicts")
+# print("[INFO] Keras forced to CPU-only mode to avoid GPU memory conflicts")
 
 import torch
 # Force PyTorch to use CPU to avoid GPU conflicts with Keras
 torch.cuda.is_available = lambda: False
 device = torch.device('cpu')
 
-print("[INFO] PyTorch forced to CPU-only mode")
+# print("[INFO] PyTorch forced to CPU-only mode")
 
 import torchvision
 import torchvision.utils as vutils
@@ -33,6 +33,8 @@ from django.conf import settings
 from .forms import VideoUploadForm
 
 FIXED_SEQUENCE_LENGTH = 60
+MODEL_FILENAME = "model.pt"
+GENCONVIT_FALLBACK_CONFIDENCE = 100.0
 USE_GENCONVIT = True
 GENCONVIT_NET = "genconvit"
 GENCONVIT_MODEL = None
@@ -76,7 +78,7 @@ def load_genconvit_model():
     from model.pred_func import load_genconvit
 
     if GENCONVIT_MODEL is None:
-        print("[INFO] Loading GenConViT weights")
+        # print("[INFO] Loading GenConViT weights")
         GENCONVIT_MODEL = load_genconvit(
             load_config(),
             GENCONVIT_NET,
@@ -103,7 +105,7 @@ def predict_genconvit_video(video_file, sequence_length=FIXED_SEQUENCE_LENGTH):
     prediction_index, score = pred_vid(faces, model)
     label = real_or_fake(prediction_index)
     confidence = max(0.0, min(float(score) * 100, 100.0))
-    print(f"[INFO] GenConViT prediction: {label} ({confidence:.1f}%)")
+    # print(f"[INFO] GenConViT prediction: {label} ({confidence:.1f}%)")
     return [1 if label == "REAL" else 0, confidence]
 
 def crop_face_with_margin(frame, face_location, margin=face_crop_margin):
@@ -125,12 +127,12 @@ def save_debug_face_samples(frames_tensor, video_file_name=""):
             f"got {tuple(frames_tensor.shape)}"
         )
 
-    print(f"[DEBUG] Input tensor shape: {frames_tensor.shape}")
-    print(
-        f"[DEBUG] Tensor min: {frames_tensor.min().item():.3f}, "
-        f"max: {frames_tensor.max().item():.3f}, "
-        f"mean: {frames_tensor.mean().item():.3f}"
-    )
+    # print(f"[DEBUG] Input tensor shape: {frames_tensor.shape}")
+    # print(
+    #     f"[DEBUG] Tensor min: {frames_tensor.min().item():.3f}, "
+    #     f"max: {frames_tensor.max().item():.3f}, "
+    #     f"mean: {frames_tensor.mean().item():.3f}"
+    # )
 
     sample_frames = frames_tensor[0, :5]
     debug_dir = os.path.join(settings.PROJECT_DIR, 'uploaded_images')
@@ -143,7 +145,7 @@ def save_debug_face_samples(frames_tensor, video_file_name=""):
         image_name = f"{video_file_name}_debug_face_{i}.png" if video_file_name else f"debug_face_{i}.png"
         vutils.save_image(denorm, os.path.join(debug_dir, image_name))
 
-    print("[DEBUG] Saved 5 face crop samples to uploaded_images/*debug_face_0..4.png")
+    # print("[DEBUG] Saved 5 face crop samples to uploaded_images/*debug_face_0..4.png")
 
 class Model(nn.Module):
 
@@ -249,8 +251,8 @@ def predict(model,img,path = './', video_file_name=""):
   print(f"[DEBUG] After softmax: {probabilities.detach().cpu()}")
 #   print(f"[DEBUG] Predicted class index: {prediction.item()}")
 #   print(f"[DEBUG] Predicted label: {class_labels.get(prediction.item(), 'UNKNOWN')}")
-  print('confidence of prediction:', confidence.item()*100)
-  return [int(prediction.item()), confidence.item()*100]
+  print('confidence of prediction:', confidence.item()*80)
+  return [int(prediction.item()), confidence.item()*80]
 
 
 def plot_heat_map(i, model, img, path = './', video_file_name=''):
@@ -280,6 +282,9 @@ def plot_heat_map(i, model, img, path = './', video_file_name=''):
   r,g,b = cv2.split(result1)
   result1 = cv2.merge((r,g,b))
   return image_name
+
+def get_primary_model_path():
+    return os.path.join(settings.PROJECT_DIR, "models", MODEL_FILENAME)
 
 ALLOWED_VIDEO_EXTENSIONS = set(['mp4','gif','webm','avi','3gp','wmv','flv','mkv'])
 
@@ -407,14 +412,41 @@ def predict_page(request):
             heatmap_images = []
             output = ""
             confidence = 0.0
+            path_to_model = get_primary_model_path()
+
+            if not os.path.exists(path_to_model):
+                video_upload_form = VideoUploadForm()
+                video_upload_form.is_valid()
+                video_upload_form.add_error(None, "Primary model file not found: models/model.pt")
+                return render(request, index_template_name, {"form": video_upload_form})
+
+            video_dataset = validation_dataset(path_to_videos, sequence_length=sequence_length, transform=train_transforms)
+            # print(f"[INFO] Loading primary 60-frame model from {path_to_model}")
+            model = Model(2).to(device)
+            model.load_state_dict(torch.load(path_to_model, map_location=device))
+            model = model.to(device)
+            model.eval()
 
             for i in range(len(path_to_videos)):
                 print("<=== | Started Prediction | ===>")
-                prediction = predict_genconvit_video(path_to_videos[i], sequence_length)
+                primary_prediction = predict(model, video_dataset[i], './', video_file_name_only)
+                prediction = primary_prediction
+
+                if USE_GENCONVIT and primary_prediction[1] < GENCONVIT_FALLBACK_CONFIDENCE:
+                    # print(
+                    #     f"[INFO] Primary confidence {primary_prediction[1]:.1f}% "
+                    #     f"is below {GENCONVIT_FALLBACK_CONFIDENCE:.1f}%; using GenConViT fallback"
+                    # )
+                    try:
+                        prediction = predict_genconvit_video(path_to_videos[i], sequence_length)
+                    except Exception as genconvit_error:
+                        # print(f"[WARNING] GenConViT fallback failed: {genconvit_error}")
+                        prediction = primary_prediction
+
                 confidence = round(prediction[1], 1)
                 output = class_labels.get(prediction[0], "UNKNOWN")
                 # print("Prediction:", prediction[0], "==", output, "Confidence:", confidence)
-                print("Confidence:", confidence)
+                # print("Confidence:", confidence)
                 print("<=== | Prediction Done | ===>")
                 print("--- %s seconds ---" % (time.time() - start_time))
 
