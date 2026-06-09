@@ -25,8 +25,6 @@ import time
 import sys
 from torch import nn
 import torch.nn.functional as F
-import json
-import glob
 import copy
 from torchvision import models
 import shutil
@@ -34,6 +32,7 @@ from PIL import Image as pImage
 from django.conf import settings
 from .forms import VideoUploadForm
 
+FIXED_SEQUENCE_LENGTH = 60
 USE_GENCONVIT = True
 GENCONVIT_NET = "genconvit"
 GENCONVIT_MODEL = None
@@ -88,14 +87,14 @@ def load_genconvit_model():
 
     return GENCONVIT_MODEL
 
-def predict_genconvit_video(video_file, sequence_length):
+def predict_genconvit_video(video_file, sequence_length=FIXED_SEQUENCE_LENGTH):
     genconvit_src = os.path.join(settings.PROJECT_DIR, "genconvit_src")
     if genconvit_src not in sys.path:
         sys.path.insert(0, genconvit_src)
 
     from model.pred_func import df_face, pred_vid, real_or_fake
 
-    num_frames = max(1, min(int(sequence_length), 30))
+    num_frames = int(sequence_length)
     model = load_genconvit_model()
     faces = df_face(video_file, num_frames)
     if len(faces) < 1:
@@ -254,72 +253,6 @@ def predict(model,img,path = './', video_file_name=""):
   return [int(prediction.item()), confidence.item()*100]
 
 
-def predict_keras(keras_model, img, path='./', video_file_name=""):
-    """Predict using a Keras .h5 model. Expects 256x256 input.
-    Accepts the same `img` tensor format as PyTorch predict() [1, seq, 3, H, W].
-    Returns [prediction_index, confidence_percent]."""
-    import cv2
-    
-    # img shape: [1, seq, 3, H, W]
-    x = img.cpu().numpy()
-    batch_size, seq_len, c, h, w = x.shape
-    
-    # denormalize (reverse torchvision Normalize(mean,std)) -> back to approx [0,255]
-    mean_arr = np.array(mean).reshape(1,1,3,1,1)
-    std_arr = np.array(std).reshape(1,1,3,1,1)
-    x = x * std_arr + mean_arr
-    x = np.clip(x * 255, 0, 255).astype(np.uint8)
-    
-    # transpose from (1, seq, 3, H, W) to (seq, H, W, 3)
-    x = x[0].transpose(0, 2, 3, 1)  # (seq, 3, H, W) -> (seq, H, W, 3)
-    
-    # Process each frame individually and collect predictions
-    all_preds = []
-    for frame_idx in range(seq_len):
-        frame = x[frame_idx]
-        frame_resized = cv2.resize(frame, (256, 256))
-        # Normalize to [0, 1]
-        frame_resized = frame_resized.astype(np.float32) / 255.0
-        
-        # Add batch dimension: (1, 256, 256, 3)
-        frame_batch = np.expand_dims(frame_resized, axis=0)
-        
-        try:
-            # Predict on single frame
-            pred = keras_model.predict(frame_batch, verbose=0)
-            all_preds.append(pred)
-        except Exception as e:
-            print(f"[WARNING] Failed to predict frame {frame_idx}: {e}")
-            continue
-    
-    if not all_preds:
-        raise RuntimeError("No frames could be predicted")
-    
-    # Stack predictions and average across frames
-    all_preds = np.vstack(all_preds)  # Shape: (seq, num_classes) or (seq,)
-    print(f"[DEBUG] All predictions shape: {all_preds.shape}")
-    
-    # Average predictions across all frames
-    if all_preds.ndim == 2:
-        # Multiple classes: shape (seq, num_classes)
-        avg_probs = np.mean(all_preds, axis=0)
-        idx = int(np.argmax(avg_probs))
-        confidence = float(np.max(avg_probs) * 100)
-        prediction = idx
-        print(f"[DEBUG] Average probs: {avg_probs}")
-    else:
-        # Single output (sigmoid): shape (seq,)
-        avg_val = np.mean(all_preds)
-        prediction = 1 if avg_val > 0.5 else 0
-        confidence = avg_val * 100 if prediction == 1 else (100 - avg_val * 100)
-        print(f"[DEBUG] Sigmoid average: {avg_val}")
-
-    print(f"[DEBUG] Prediction: {prediction}, Confidence: {confidence}")
-    
-    # Cleanup
-    del x, all_preds
-    return [int(prediction), confidence]
-
 def plot_heat_map(i, model, img, path = './', video_file_name=''):
   fmap,logits = model(img.to(device))
   params = list(model.parameters())
@@ -348,43 +281,6 @@ def plot_heat_map(i, model, img, path = './', video_file_name=''):
   result1 = cv2.merge((r,g,b))
   return image_name
 
-# Model Selection
-def get_accurate_model(sequence_length):
-    model_name = []
-    sequence_model = []
-    final_model = ""
-    # Prefer explicit dfd-model.h5 if present
-    h5_model_path = os.path.join(settings.PROJECT_DIR, "models", "dfd-model.h5")
-    if os.path.exists(h5_model_path):
-        return h5_model_path
-
-    list_models = glob.glob(os.path.join(settings.PROJECT_DIR, "models", "*.pt"))
-
-    for model_path in list_models:
-        model_name.append(os.path.basename(model_path))
-
-    for model_filename in model_name:
-        try:
-            seq = model_filename.split("_")[3]
-            if int(seq) == sequence_length:
-                sequence_model.append(model_filename)
-        except IndexError:
-            pass  # Handle cases where the filename format doesn't match expected
-
-    if len(sequence_model) > 1:
-        accuracy = []
-        for filename in sequence_model:
-            acc = filename.split("_")[1]
-            accuracy.append(acc)  # Convert accuracy to float for proper comparison
-        max_index = accuracy.index(max(accuracy))
-        final_model = os.path.join(settings.PROJECT_DIR, "models", sequence_model[max_index])
-    elif len(sequence_model) == 1:
-        final_model = os.path.join(settings.PROJECT_DIR, "models", sequence_model[0])
-    else:
-        print("No model found for the specified sequence length.")  # Handle no models found case
-
-    return final_model
-
 ALLOWED_VIDEO_EXTENSIONS = set(['mp4','gif','webm','avi','3gp','wmv','flv','mkv'])
 
 def allowed_video_file(filename):
@@ -408,16 +304,12 @@ def index(request):
         if video_upload_form.is_valid():
             video_file = video_upload_form.cleaned_data['upload_video_file']
             video_file_ext = video_file.name.split('.')[-1]
-            sequence_length = video_upload_form.cleaned_data['sequence_length']
+            sequence_length = FIXED_SEQUENCE_LENGTH
             video_content_type = video_file.content_type.split('/')[0]
             if video_content_type in settings.CONTENT_TYPES:
                 if video_file.size > int(settings.MAX_UPLOAD_SIZE):
                     video_upload_form.add_error("upload_video_file", "Maximum file size 100 MB")
                     return render(request, index_template_name, {"form": video_upload_form})
-
-            if sequence_length <= 0:
-                video_upload_form.add_error("sequence_length", "Sequence Length must be greater than 0")
-                return render(request, index_template_name, {"form": video_upload_form})
             
             if allowed_video_file(video_file.name) == False:
                 video_upload_form.add_error("upload_video_file","Only video files are allowed ")
@@ -444,8 +336,7 @@ def predict_page(request):
             return redirect("ml_app:home")
         if 'file_name' in request.session:
             video_file = request.session['file_name']
-        if 'sequence_length' in request.session:
-            sequence_length = request.session['sequence_length']
+        sequence_length = FIXED_SEQUENCE_LENGTH
         path_to_videos = [video_file]
         video_file_name = os.path.basename(video_file)
         video_file_name_only = os.path.splitext(video_file_name)[0]
@@ -458,45 +349,6 @@ def predict_page(request):
 
         video_dataset = None
         model = None
-        path_to_model = "GenConViT"
-        is_keras_model = False
-        keras_model = None
-        if not USE_GENCONVIT:
-            # Load validation dataset
-            video_dataset = validation_dataset(path_to_videos, sequence_length=sequence_length, transform=train_transforms)
-
-            # Load model (prefer .h5 if present)
-            path_to_model = get_accurate_model(sequence_length)
-            if not path_to_model:
-                video_upload_form = VideoUploadForm()
-                video_upload_form.add_error("sequence_length", "No model found for the selected sequence length")
-                return render(request, index_template_name, {"form": video_upload_form})
-
-            is_keras_model = str(path_to_model).lower().endswith('.h5')
-
-        if not USE_GENCONVIT and is_keras_model:
-            try:
-                from tensorflow.keras.models import load_model
-                import tensorflow as tf
-                # Prevent TensorFlow from pre-allocating GPU memory
-                gpus = tf.config.list_physical_devices('GPU')
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-            except Exception as e:
-                print(f"TensorFlow/Keras not available: {e}")
-                return render(request, 'cuda_full.html')
-            try:
-                keras_model = load_model(path_to_model)
-                print(f"Loaded Keras model from {path_to_model}")
-            except Exception as e:
-                print(f"Failed to load Keras model: {e}")
-                return render(request, 'cuda_full.html')
-            model = None
-        elif not USE_GENCONVIT:
-            model = Model(2).to(device)  # Adjust the model instantiation according to your model structure
-            model.load_state_dict(torch.load(path_to_model, map_location=device))
-            model = model.to(device)
-            model.eval()
         start_time = time.time()
         # Display preprocessing images
         print("<=== | Started Videos Splitting | ===>")
@@ -558,12 +410,7 @@ def predict_page(request):
 
             for i in range(len(path_to_videos)):
                 print("<=== | Started Prediction | ===>")
-                if USE_GENCONVIT:
-                    prediction = predict_genconvit_video(path_to_videos[i], sequence_length)
-                elif 'is_keras_model' in locals() and is_keras_model:
-                    prediction = predict_keras(keras_model, video_dataset[i], './', video_file_name_only)
-                else:
-                    prediction = predict(model, video_dataset[i], './', video_file_name_only)
+                prediction = predict_genconvit_video(path_to_videos[i], sequence_length)
                 confidence = round(prediction[1], 1)
                 output = class_labels.get(prediction[0], "UNKNOWN")
                 # print("Prediction:", prediction[0], "==", output, "Confidence:", confidence)
@@ -577,8 +424,6 @@ def predict_page(request):
 
             # Cleanup memory after prediction to free up GPU/CPU resources
             import gc
-            if 'keras_model' in locals() and keras_model is not None:
-                del keras_model
             if 'model' in locals() and model is not None:
                 del model
             if 'video_dataset' in locals():
