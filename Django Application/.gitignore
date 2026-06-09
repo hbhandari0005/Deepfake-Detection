@@ -7,4 +7,5 @@ uploaded_images/*
 !uploaded_images/Readme.txt
 uploaded_videos/*
 !uploaded_videos/Readme.txt
-
+genconvit_weights/
+genconvit_src/

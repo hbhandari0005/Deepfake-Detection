@@ -34,6 +34,10 @@ from PIL import Image as pImage
 from django.conf import settings
 from .forms import VideoUploadForm
 
+USE_GENCONVIT = True
+GENCONVIT_NET = "genconvit"
+GENCONVIT_MODEL = None
+
 index_template_name = 'index.html'
 predict_template_name = 'predict.html'
 about_template_name = "about.html"
@@ -51,6 +55,57 @@ train_transforms = transforms.Compose([
                                         transforms.Resize((im_size,im_size)),
                                         transforms.ToTensor(),
                                         transforms.Normalize(mean,std)])
+
+def load_genconvit_model():
+    global GENCONVIT_MODEL
+
+    genconvit_src = os.path.join(settings.PROJECT_DIR, "genconvit_src")
+    ed_weight = os.path.join(settings.PROJECT_DIR, "genconvit_weights", "genconvit_ed_inference.pth")
+    vae_weight = os.path.join(settings.PROJECT_DIR, "genconvit_weights", "genconvit_vae_inference.pth")
+
+    if not os.path.isdir(genconvit_src):
+        raise FileNotFoundError(f"GenConViT source folder not found: {genconvit_src}")
+    if not os.path.exists(ed_weight):
+        raise FileNotFoundError(f"GenConViT ED weight not found: {ed_weight}")
+    if not os.path.exists(vae_weight):
+        raise FileNotFoundError(f"GenConViT VAE weight not found: {vae_weight}")
+
+    if genconvit_src not in sys.path:
+        sys.path.insert(0, genconvit_src)
+
+    from model.config import load_config
+    from model.pred_func import load_genconvit
+
+    if GENCONVIT_MODEL is None:
+        print("[INFO] Loading GenConViT weights")
+        GENCONVIT_MODEL = load_genconvit(
+            load_config(),
+            GENCONVIT_NET,
+            ed_weight,
+            vae_weight,
+            fp16=False,
+        )
+
+    return GENCONVIT_MODEL
+
+def predict_genconvit_video(video_file, sequence_length):
+    genconvit_src = os.path.join(settings.PROJECT_DIR, "genconvit_src")
+    if genconvit_src not in sys.path:
+        sys.path.insert(0, genconvit_src)
+
+    from model.pred_func import df_face, pred_vid, real_or_fake
+
+    num_frames = max(1, min(int(sequence_length), 30))
+    model = load_genconvit_model()
+    faces = df_face(video_file, num_frames)
+    if len(faces) < 1:
+        raise RuntimeError("GenConViT could not detect a face in the selected video frames")
+
+    prediction_index, score = pred_vid(faces, model)
+    label = real_or_fake(prediction_index)
+    confidence = max(0.0, min(float(score) * 100, 100.0))
+    print(f"[INFO] GenConViT prediction: {label} ({confidence:.1f}%)")
+    return [1 if label == "REAL" else 0, confidence]
 
 def crop_face_with_margin(frame, face_location, margin=face_crop_margin):
     top, right, bottom, left = face_location
@@ -401,19 +456,25 @@ def predict_page(request):
         else:
             production_video_name = video_file_name
 
-        # Load validation dataset
-        video_dataset = validation_dataset(path_to_videos, sequence_length=sequence_length, transform=train_transforms)
-
-        # Load model (prefer .h5 if present)
-        path_to_model = get_accurate_model(sequence_length)
-        if not path_to_model:
-            video_upload_form = VideoUploadForm()
-            video_upload_form.add_error("sequence_length", "No model found for the selected sequence length")
-            return render(request, index_template_name, {"form": video_upload_form})
-
-        is_keras_model = str(path_to_model).lower().endswith('.h5')
+        video_dataset = None
+        model = None
+        path_to_model = "GenConViT"
+        is_keras_model = False
         keras_model = None
-        if is_keras_model:
+        if not USE_GENCONVIT:
+            # Load validation dataset
+            video_dataset = validation_dataset(path_to_videos, sequence_length=sequence_length, transform=train_transforms)
+
+            # Load model (prefer .h5 if present)
+            path_to_model = get_accurate_model(sequence_length)
+            if not path_to_model:
+                video_upload_form = VideoUploadForm()
+                video_upload_form.add_error("sequence_length", "No model found for the selected sequence length")
+                return render(request, index_template_name, {"form": video_upload_form})
+
+            is_keras_model = str(path_to_model).lower().endswith('.h5')
+
+        if not USE_GENCONVIT and is_keras_model:
             try:
                 from tensorflow.keras.models import load_model
                 import tensorflow as tf
@@ -431,7 +492,7 @@ def predict_page(request):
                 print(f"Failed to load Keras model: {e}")
                 return render(request, 'cuda_full.html')
             model = None
-        else:
+        elif not USE_GENCONVIT:
             model = Model(2).to(device)  # Adjust the model instantiation according to your model structure
             model.load_state_dict(torch.load(path_to_model, map_location=device))
             model = model.to(device)
@@ -497,7 +558,9 @@ def predict_page(request):
 
             for i in range(len(path_to_videos)):
                 print("<=== | Started Prediction | ===>")
-                if 'is_keras_model' in locals() and is_keras_model:
+                if USE_GENCONVIT:
+                    prediction = predict_genconvit_video(path_to_videos[i], sequence_length)
+                elif 'is_keras_model' in locals() and is_keras_model:
                     prediction = predict_keras(keras_model, video_dataset[i], './', video_file_name_only)
                 else:
                     prediction = predict(model, video_dataset[i], './', video_file_name_only)

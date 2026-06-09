@@ -7,3 +7,5 @@ __pycache__/
 Django Application/db.sqlite3
 Django Application/uploaded_images/
 Django Application/uploaded_videos/
+Django Application/genconvit_weights/
+Django Application/genconvit_src/
